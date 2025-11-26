@@ -1218,27 +1218,7 @@ query {
         This method preserves individual commit history by replaying each commit
         from the PR branch onto the base branch. Optimized for performance with
         maximum parallelism:
-        
-        1. Parallel fetch of head/base refs and compare API
-        2. Early exit if no commits to rebase
-        3. Parallel fetch of commit details + ref re-checks (maximizes concurrency)
-        4. Handle base branch updates if detected
-        5. Sequential commit replay (unavoidable - each depends on previous)
-        6. Final head ref check before update
-        7. Ref update with force=True
-        
-        Performance optimizations:
-        - Maximum parallelism: Initial refs fetched in parallel
-        - Concurrent operations: Commit fetches run alongside ref checks
-        - Reduced ref checks: Only 3 checks (down from 4) while maintaining safety
-        - Early exits: Fast path when no commits need rebasing
-        
-        Race condition mitigation:
-        - Force-with-lease checks at critical points
-        - Base branch changes detected and handled automatically
-        - Head ref verified before and after commit creation
-        - Kodiak processes PRs serially per repository (additional protection)
-        
+
         Args:
             base_ref: The base branch name (e.g., "main")
             head_ref: The PR branch name (e.g., "feature-branch")
