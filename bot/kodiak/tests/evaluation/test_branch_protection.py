@@ -1,6 +1,6 @@
 import pytest
 
-from kodiak.config import MergeMethod
+from kodiak.config import MergeMethod, UpdateStrategy
 from kodiak.errors import PollForever
 from kodiak.queries import (
     CheckConclusionState,
@@ -240,6 +240,7 @@ async def test_mergeable_update_branch_immediately() -> None:
     pull_request.mergeStateStatus = MergeStateStatus.BEHIND
     branch_protection.requiresStrictStatusChecks = True
     config.merge.update_branch_immediately = True
+    config.update.strategy = UpdateStrategy.merge  # Explicitly set strategy
 
     await mergeable(
         api=api,
@@ -271,6 +272,7 @@ async def test_mergeable_update_branch_immediately_mode_merging() -> None:
     pull_request.mergeStateStatus = MergeStateStatus.BEHIND
     branch_protection.requiresStrictStatusChecks = True
     config.merge.update_branch_immediately = True
+    config.update.strategy = UpdateStrategy.merge  # Explicitly set strategy
 
     with pytest.raises(PollForever):
         await mergeable(
@@ -303,6 +305,7 @@ async def test_mergeable_optimistic_update_need_branch_update() -> None:
     context = create_context()
 
     config.merge.optimistic_updates = True
+    config.update.strategy = UpdateStrategy.merge  # Explicitly set strategy
     pull_request.mergeStateStatus = MergeStateStatus.BEHIND
     branch_protection.requiresStrictStatusChecks = True
     branch_protection.requiresStatusChecks = True
@@ -501,6 +504,7 @@ async def test_mergeable_wait_for_checks() -> None:
     pull_request = create_pull_request()
     branch_protection = create_branch_protection()
     config.merge.optimistic_updates = False
+    config.update.strategy = UpdateStrategy.merge  # Explicitly set strategy
     pull_request.mergeStateStatus = MergeStateStatus.BEHIND
     branch_protection.requiresStrictStatusChecks = True
 
@@ -624,6 +628,7 @@ async def test_mergeable_update_always_enabled_merging_behind_pull_request() -> 
     branch_protection = create_branch_protection()
 
     config.update.always = True
+    config.update.strategy = UpdateStrategy.merge  # Explicitly set strategy
     pull_request.mergeStateStatus = MergeStateStatus.BEHIND
     branch_protection.requiresStrictStatusChecks = True
 

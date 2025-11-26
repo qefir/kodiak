@@ -8,6 +8,7 @@ import structlog
 from typing_extensions import Protocol
 
 import kodiak.app_config as conf
+from kodiak.config import UpdateStrategy, V1
 from kodiak.errors import (
     ApiCallException,
     GitHubApiInternalServerError,
@@ -257,18 +258,41 @@ class PRV2:
                     self.log.warning("failed to delete branch", res=res, exc_info=True)
 
     async def update_branch(self) -> None:
-        self.log.info("update_branch")
+        """
+        Update the PR branch using the configured update strategy.
+        
+        This method handles both merge and rebase strategies:
+        - merge: Uses GitHub's update-branch endpoint (merges base into PR branch)
+        - rebase: Uses custom rebase implementation (replays commits on top of base)
+        """
+        config = self.event.config
+        update_strategy = (
+            config.update.strategy if isinstance(config, V1) else UpdateStrategy.merge
+        )
+        
+        self.log.info("update_branch", strategy=update_strategy.value)
         async with self.client(
             installation_id=self.install, owner=self.owner, repo=self.repo
         ) as api_client:
-            res = await api_client.update_branch(pull_number=self.number)
+            if update_strategy == UpdateStrategy.rebase:
+                res = await api_client.rebase_branch(
+                    base_ref=self.event.pull_request.baseRefName,
+                    head_ref=self.event.pull_request.headRefName,
+                    head_sha=self.event.pull_request.latest_sha,
+                )
+                method_name = "pull_request/rebase_branch"
+            else:
+                res = await api_client.update_branch(pull_number=self.number)
+                method_name = "pull_request/update_branch"
+            
             try:
                 res.raise_for_status()
             except HTTPError:
-                self.log.warning("failed to update branch", res=res, exc_info=True)
-                # we raise an exception to retry this request.
+                self.log.warning(
+                    "failed to update branch", strategy=update_strategy.value, res=res, exc_info=True
+                )
                 raise ApiCallException(
-                    method="pull_request/update_branch",
+                    method=method_name,
                     http_status_code=res.status_code,
                     response=res.content,
                 )

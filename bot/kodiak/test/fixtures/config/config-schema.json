@@ -61,6 +61,7 @@
         "always": false,
         "require_automerge_label": true,
         "autoupdate_label": null,
+        "strategy": "merge",
         "blacklist_usernames": [],
         "ignored_usernames": []
       },
@@ -372,6 +373,15 @@
         }
       }
     },
+    "UpdateStrategy": {
+      "title": "UpdateStrategy",
+      "description": "An enumeration.",
+      "enum": [
+        "merge",
+        "rebase"
+      ],
+      "type": "string"
+    },
     "Update": {
       "title": "Update",
       "type": "object",
@@ -389,6 +399,14 @@
         "autoupdate_label": {
           "title": "Autoupdate Label",
           "type": "string"
+        },
+        "strategy": {
+          "default": "merge",
+          "allOf": [
+            {
+              "$ref": "#/definitions/UpdateStrategy"
+            }
+          ]
         },
         "blacklist_usernames": {
           "title": "Blacklist Usernames",

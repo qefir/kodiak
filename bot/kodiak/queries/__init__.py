@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import urllib
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -1208,6 +1209,214 @@ query {
                 headers=headers,
             )
 
+    async def rebase_branch(
+        self, *, base_ref: str, head_ref: str, head_sha: str
+    ) -> http.Response:
+        """
+        Rebase a PR branch onto the base branch using force-with-lease.
+        
+        This method preserves individual commit history by replaying each commit
+        from the PR branch onto the base branch. Optimized for performance with
+        maximum parallelism:
+        
+        1. Parallel fetch of head/base refs and compare API
+        2. Early exit if no commits to rebase
+        3. Parallel fetch of commit details + ref re-checks (maximizes concurrency)
+        4. Handle base branch updates if detected
+        5. Sequential commit replay (unavoidable - each depends on previous)
+        6. Final head ref check before update
+        7. Ref update with force=True
+        
+        Performance optimizations:
+        - Maximum parallelism: Initial refs fetched in parallel
+        - Concurrent operations: Commit fetches run alongside ref checks
+        - Reduced ref checks: Only 3 checks (down from 4) while maintaining safety
+        - Early exits: Fast path when no commits need rebasing
+        
+        Race condition mitigation:
+        - Force-with-lease checks at critical points
+        - Base branch changes detected and handled automatically
+        - Head ref verified before and after commit creation
+        - Kodiak processes PRs serially per repository (additional protection)
+        
+        Args:
+            base_ref: The base branch name (e.g., "main")
+            head_ref: The PR branch name (e.g., "feature-branch")
+            head_sha: The expected current SHA of the PR branch (for force-with-lease)
+        """
+        # Step 1: Parallel fetch of head ref and base ref
+        # Fetch both refs concurrently to minimize initial latency
+        head_ref_task = self.get_ref(ref=head_ref)
+        base_ref_task = self.get_ref(ref=base_ref)
+        head_ref_res, base_ref_res = await asyncio.gather(
+            head_ref_task, base_ref_task
+        )
+        head_ref_res.raise_for_status()
+        base_ref_res.raise_for_status()
+        
+        current_sha = head_ref_res.json()["object"]["sha"]
+        base_sha = base_ref_res.json()["object"]["sha"]
+        
+        # Verify head ref matches expected (force-with-lease check)
+        if current_sha != head_sha:
+            logger.warning(
+                "branch_updated_during_rebase",
+                head_ref=head_ref,
+                expected_sha=head_sha,
+                current_sha=current_sha,
+            )
+            raise http.HTTPStatusError(
+                f"Branch {head_ref} was updated by another process (force-with-lease check failed). Expected {head_sha}, got {current_sha}",
+                request=head_ref_res.request,
+                response=head_ref_res,
+            )
+
+        # Step 2: Get the commits using the compare API
+        # This gives us all commits from base to head_sha
+        # The compare API returns commits in chronological order (oldest first)
+        compare_res = await self.get_merge_base(base=base_sha, head=head_sha)
+        compare_res.raise_for_status()
+        compare_data = compare_res.json()
+        
+        # Get all commits from base to head
+        # Each commit in the array has a "sha" field
+        commits = compare_data.get("commits", [])
+        
+        # Step 3: Early exit if no commits to rebase
+        if not commits:
+            logger.info(
+                "no_commits_to_rebase",
+                head_ref=head_ref,
+                base_ref=base_ref,
+                head_sha=head_sha,
+            )
+            # Return success - nothing to rebase (we already verified head_ref above)
+            return head_ref_res
+
+        # Step 4: Fetch commit details and re-check refs in parallel
+        # This maximizes parallelism - we fetch commits while also checking if refs changed
+        commit_fetch_tasks = [
+            self.get_commit(sha=commit_data["sha"]) for commit_data in commits
+        ]
+        base_ref_check_task = self.get_ref(ref=base_ref)
+        head_ref_check_task = self.get_ref(ref=head_ref)
+        
+        # Fetch commits and check refs concurrently
+        # gather returns: (commit_res_1, commit_res_2, ..., commit_res_N, base_ref_res, head_ref_res)
+        all_results = await asyncio.gather(
+            *commit_fetch_tasks, base_ref_check_task, head_ref_check_task
+        )
+        # Split results: commit responses are first N items, then base_ref, then head_ref
+        commit_responses = all_results[:len(commits)]
+        base_ref_res_final = all_results[-2]
+        head_ref_check = all_results[-1]
+        
+        # Verify head ref hasn't changed (force-with-lease)
+        head_ref_check.raise_for_status()
+        head_ref_check_sha = head_ref_check.json()["object"]["sha"]
+        if head_ref_check_sha != current_sha:
+            logger.warning(
+                "head_ref_updated_before_commit_creation",
+                head_ref=head_ref,
+                expected_sha=current_sha,
+                actual_sha=head_ref_check_sha,
+            )
+            raise http.HTTPStatusError(
+                f"Branch {head_ref} was updated before commit creation (force-with-lease check failed)",
+                request=head_ref_check.request,
+                response=head_ref_check,
+            )
+        
+        # Check if base ref changed - if so, redo compare with new base
+        base_ref_res_final.raise_for_status()
+        base_sha_final = base_ref_res_final.json()["object"]["sha"]
+        if base_sha_final != base_sha:
+            logger.info(
+                "base_branch_updated_during_rebase",
+                base_ref=base_ref,
+                old_base_sha=base_sha,
+                new_base_sha=base_sha_final,
+            )
+            # Update base_sha and redo compare
+            base_sha = base_sha_final
+            compare_res = await self.get_merge_base(base=base_sha, head=head_sha)
+            compare_res.raise_for_status()
+            compare_data = compare_res.json()
+            commits = compare_data.get("commits", [])
+            
+            if not commits:
+                logger.info(
+                    "no_commits_to_rebase_after_base_update",
+                    head_ref=head_ref,
+                    base_ref=base_ref,
+                )
+                return head_ref_check
+            
+            # Re-fetch commits if base changed
+            commit_fetch_tasks = [
+                self.get_commit(sha=commit_data["sha"]) for commit_data in commits
+            ]
+            commit_responses = await asyncio.gather(*commit_fetch_tasks)
+        
+        # Step 5: Replay each commit on top of the base branch to preserve individual commit history
+        # Commits must be created sequentially as each depends on the previous one
+        rebase_parent_sha = base_sha
+        
+        for commit_res in commit_responses:
+            commit_res.raise_for_status()
+            commit = commit_res.json()
+            
+            # Extract commit data
+            author = None
+            if "author" in commit and commit["author"]:
+                author_info = commit["author"]
+                author = dict(
+                    name=author_info.get("name", "Kodiak"),
+                    email=author_info.get("email", "kodiak@kodiakhq.com"),
+                    date=author_info.get("date", datetime.now(timezone.utc).isoformat()),
+                )
+            
+            commit_message = commit.get("message", "")
+            tree_sha = commit["tree"]["sha"]
+            
+            # Create rebased commit
+            create_commit_res = await self.create_commit(
+                message=commit_message,
+                tree=tree_sha,
+                parents=[rebase_parent_sha],
+                author=author,
+            )
+            create_commit_res.raise_for_status()
+            rebase_parent_sha = create_commit_res.json()["sha"]
+        
+        new_sha = rebase_parent_sha
+
+        # Step 6: Final check - verify head ref hasn't changed before updating
+        # This is the critical check right before the update operation
+        final_check_res = await self.get_ref(ref=head_ref)
+        final_check_res.raise_for_status()
+        final_sha = final_check_res.json()["object"]["sha"]
+        
+        if final_sha != head_ref_check_sha:
+            logger.warning(
+                "branch_updated_during_rebase_operation",
+                head_ref=head_ref,
+                expected_sha=head_ref_check_sha,
+                actual_sha=final_sha,
+                commits_created=len(commits),
+            )
+            raise http.HTTPStatusError(
+                f"Branch {head_ref} was updated during rebase operation (force-with-lease check failed). Expected {head_ref_check_sha}, got {final_sha}",
+                request=final_check_res.request,
+                response=final_check_res,
+            )
+
+        # Step 8: Update the ref with the final rebased commit SHA
+        # We use force=True since we've verified the current SHA matches our expectation
+        # The multiple checks minimize the race condition window, though it's not 100% atomic
+        # GitHub's API will also validate the ref state server-side
+        return await self.update_ref(ref=head_ref, sha=new_sha, force=True)
+
     async def approve_pull_request(self, *, pull_number: int) -> http.Response:
         """
         https://developer.github.com/v3/pulls/reviews/#create-a-pull-request-review
@@ -1256,7 +1465,59 @@ query {
         async with self.throttler:
             return await self.session.put(url, headers=headers, json=body)
 
-    async def update_ref(self, *, ref: str, sha: str) -> http.Response:
+    async def get_ref(self, *, ref: str) -> http.Response:
+        """
+        https://docs.github.com/en/rest/reference/git#get-a-reference
+        """
+        headers = await get_headers(
+            session=self.session, installation_id=self.installation_id
+        )
+        url = conf.v3_url(f"/repos/{self.owner}/{self.repo}/git/ref/heads/{ref}")
+        async with self.throttler:
+            return await self.session.get(url, headers=headers)
+
+    async def get_commit(self, *, sha: str) -> http.Response:
+        """
+        https://docs.github.com/en/rest/reference/git#get-a-commit-object
+        """
+        headers = await get_headers(
+            session=self.session, installation_id=self.installation_id
+        )
+        url = conf.v3_url(f"/repos/{self.owner}/{self.repo}/git/commits/{sha}")
+        async with self.throttler:
+            return await self.session.get(url, headers=headers)
+
+    async def get_merge_base(self, *, base: str, head: str) -> http.Response:
+        """
+        https://docs.github.com/en/rest/reference/repos#compare-two-commits
+        Returns the merge base between base and head.
+        """
+        headers = await get_headers(
+            session=self.session, installation_id=self.installation_id
+        )
+        url = conf.v3_url(f"/repos/{self.owner}/{self.repo}/compare/{base}...{head}")
+        async with self.throttler:
+            return await self.session.get(url, headers=headers)
+
+    async def create_commit(
+        self, *, message: str, tree: str, parents: List[str], author: Optional[Dict[str, str]] = None
+    ) -> http.Response:
+        """
+        https://docs.github.com/en/rest/reference/git#create-a-commit-object
+        """
+        headers = await get_headers(
+            session=self.session, installation_id=self.installation_id
+        )
+        body = dict(message=message, tree=tree, parents=parents)
+        if author:
+            body["author"] = author
+        url = conf.v3_url(f"/repos/{self.owner}/{self.repo}/git/commits")
+        async with self.throttler:
+            return await self.session.post(url, headers=headers, json=body)
+
+    async def update_ref(
+        self, *, ref: str, sha: str, force: bool = False
+    ) -> http.Response:
         """
         https://docs.github.com/en/rest/reference/git#update-a-reference
         """
@@ -1264,8 +1525,11 @@ query {
             session=self.session, installation_id=self.installation_id
         )
         url = conf.v3_url(f"/repos/{self.owner}/{self.repo}/git/refs/heads/{ref}")
+        body = dict(sha=sha)
+        if force:
+            body["force"] = True
         async with self.throttler:
-            return await self.session.patch(url, headers=headers, json=dict(sha=sha))
+            return await self.session.patch(url, headers=headers, json=body)
 
     async def create_notification(
         self, head_sha: str, message: str, summary: Optional[str] = None

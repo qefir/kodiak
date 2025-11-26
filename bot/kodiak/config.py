@@ -119,6 +119,11 @@ class Merge(BaseModel):
     do_not_merge: bool = False
 
 
+class UpdateStrategy(str, Enum):
+    merge = "merge"
+    rebase = "rebase"
+
+
 class Update(BaseModel):
     # update PR whenever the PR is out of date with the base branch. PR will be
     # updated regardless of failing requirements for merge (e.g. failing status
@@ -128,6 +133,10 @@ class Update(BaseModel):
     always: bool = False
     require_automerge_label: bool = True
     autoupdate_label: Optional[str] = None
+    # Strategy for updating branches: "merge" (default) merges the base branch
+    # into the PR branch, "rebase" rebases the PR branch onto the base branch
+    # using force-with-lease.
+    strategy: UpdateStrategy = UpdateStrategy.merge
     # Do not update PRs created by a listed user.
     blacklist_usernames: List[str] = []  # deprecated for ignored_usernames
     ignored_usernames: List[str] = []

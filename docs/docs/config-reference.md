@@ -498,6 +498,26 @@ update.ignored_usernames = ["bernard-lowe", "dependabot-preview"]
 
 > **NOTE:** `update.ignored_usernames` is a new name for `update.blacklist_usernames`. Both options behave identically.
 
+### `update.strategy`
+
+- **type:** `string`
+- **default:** `"rebase"`
+- **options:** `"merge"`, `"rebase"`
+
+Strategy for updating branches when a PR is out of date with its base branch:
+
+- `"merge"`: Merges the base branch into the PR branch using GitHub's update-branch endpoint (atomic operation)
+- `"rebase"`: Rebases the PR branch onto the base branch using force-with-lease, preserving individual commit history
+
+> **NOTE:** GitHub API doesn't provide an atomic rebase operation. The rebase strategy uses multiple API calls with force-with-lease checks. If the branch is updated concurrently during rebase, Kodiak will detect it, abort the operation, and retry on the next evaluation cycle.
+
+#### example
+
+```toml
+[update]
+strategy = "rebase"  # default: "rebase"
+```
+
 ### `approve.auto_approve_usernames`
 
 - **type:** `string[]`
@@ -723,6 +743,11 @@ always = false # default: false
 # (configured via `merge.automerge_label`). When disable, Kodiak will update any
 # PR. This option only applies when `update.always = true`.
 require_automerge_label = true # default: true
+
+# Strategy for updating branches: "merge" (atomic) or "rebase" (uses force-with-lease).
+# NOTE: GitHub API doesn't provide atomic rebase. If branch is updated concurrently,
+# rebase will abort and retry on next cycle.
+strategy = "merge" # default: "merge", options: []"merge", "rebase"]
 
 [approve]
 

@@ -23,6 +23,7 @@ from kodiak.config import (
     MergeBodyStyle,
     MergeMethod,
     MergeTitleStyle,
+    UpdateStrategy,
 )
 from kodiak.dependencies import dep_versions_from_pr
 from kodiak.errors import (
@@ -328,6 +329,31 @@ class PRAPI(Protocol):
 
     async def approve_pull_request(self) -> None:
         ...
+
+
+async def set_update_branch_status(
+    set_status_func: Callable[[str, Optional[str]], Awaitable[None]],
+    update_strategy: UpdateStrategy,
+    *,
+    reason: Optional[str] = None,
+    merging: bool = False,
+) -> None:
+    if update_strategy == UpdateStrategy.rebase:
+        if merging:
+            await set_status_func("⛴ merging PR (rebasing branch)")
+        else:
+            await set_status_func(
+                "🔄 rebasing branch",
+                markdown_content=f"branch rebased because `{reason}` and `update.strategy = \"rebase\"` are configured.",
+            )
+    else:
+        if merging:
+            await set_status_func("⛴ merging PR (updating branch)")
+        else:
+            await set_status_func(
+                "🔄 updating branch",
+                markdown_content=f"branch updated because `{reason}` is configured.",
+            )
 
 
 async def cfg_err(
@@ -737,9 +763,8 @@ async def mergeable(
             return
 
     if need_branch_update and not merging and auto_update_enabled:
-        await set_status(
-            "🔄 updating branch",
-            markdown_content="branch updated because `update.always = true` is configured.",
+        await set_update_branch_status(
+            set_status, config.update.strategy, reason="update.always = true"
         )
         await api.update_branch()
         return
@@ -1018,9 +1043,10 @@ async def mergeable(
         )
 
         if config.merge.update_branch_immediately and need_branch_update:
-            await set_status(
-                "🔄 updating branch",
-                markdown_content="branch updated because `merge.update_branch_immediately = true` is configured.",
+            await set_update_branch_status(
+                set_status,
+                config.update.strategy,
+                reason="merge.update_branch_immediately = true",
             )
             await api.update_branch()
             if merging:
@@ -1031,7 +1057,9 @@ async def mergeable(
             # prioritize branch updates over waiting for status checks to complete
             if config.merge.optimistic_updates:
                 if need_branch_update:
-                    await set_status("⛴ merging PR (updating branch)")
+                    await set_update_branch_status(
+                        set_status, config.update.strategy, merging=True
+                    )
                     await api.update_branch()
                     raise PollForever
                 if wait_for_checks:
@@ -1048,7 +1076,9 @@ async def mergeable(
                     )
                     raise PollForever
                 if need_branch_update:
-                    await set_status("⛴ merging PR (updating branch)")
+                    await set_update_branch_status(
+                        set_status, config.update.strategy, merging=True
+                    )
                     await api.update_branch()
                     raise PollForever
 

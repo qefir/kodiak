@@ -4,7 +4,7 @@ import logging
 import re
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, cast
+from typing import Any, Dict, Iterable, Iterator, List, Optional, cast
 
 import pytest
 from pytest_mock import MockFixture
@@ -859,3 +859,364 @@ async def test_get_open_pull_requests_page_limit(
     assert res is not None
     assert len(res) == 2000
     assert patched_session_get.call_count == 20, "stop calling after 20 pages"
+
+
+# Rebase tests
+def create_ref_response(sha: str) -> Response:
+    """Create a fake ref response."""
+    return Response(
+        status_code=200,
+        content=json.dumps({"object": {"sha": sha}}).encode(),
+        request=Request(method="", url=""),
+    )
+
+
+def create_compare_response(commits: List[Dict[str, str]]) -> Response:
+    """Create a fake compare API response."""
+    return Response(
+        status_code=200,
+        content=json.dumps({"commits": commits}).encode(),
+        request=Request(method="", url=""),
+    )
+
+
+def create_commit_response(
+    sha: str, message: str, tree_sha: str, author: Optional[Dict[str, str]] = None
+) -> Response:
+    """Create a fake commit response."""
+    commit_data = {
+        "sha": sha,
+        "message": message,
+        "tree": {"sha": tree_sha},
+    }
+    if author:
+        commit_data["author"] = author
+    return Response(
+        status_code=200,
+        content=json.dumps(commit_data).encode(),
+        request=Request(method="", url=""),
+    )
+
+
+def create_create_commit_response(sha: str) -> Response:
+    """Create a fake create commit response."""
+    return Response(
+        status_code=201,
+        content=json.dumps({"sha": sha}).encode(),
+        request=Request(method="", url=""),
+    )
+
+
+def create_update_ref_response() -> Response:
+    """Create a fake update ref response."""
+    return Response(
+        status_code=200,
+        content=json.dumps({"ref": "refs/heads/feature"}).encode(),
+        request=Request(method="", url=""),
+    )
+
+
+async def test_rebase_branch_success(
+    mocker: MockFixture, api_client: Client, mock_get_token_for_install: None
+) -> None:
+    """
+    Test successful rebase with multiple commits.
+    """
+    base_sha = "base123"
+    head_sha = "head123"
+    commit1_sha = "commit1"
+    commit2_sha = "commit2"
+    rebased1_sha = "rebased1"
+    rebased2_sha = "rebased2"
+
+    # Mock all API calls
+    mocker.patch(
+        "kodiak.queries.http.AsyncClient.get",
+        side_effect=[
+            # Initial ref fetches (parallel)
+            wrap_future(create_ref_response(head_sha)),  # head_ref
+            wrap_future(create_ref_response(base_sha)),  # base_ref
+            # Compare API
+            wrap_future(
+                create_compare_response(
+                    [{"sha": commit1_sha}, {"sha": commit2_sha}]
+                )
+            ),
+            # Commit fetches + ref checks (parallel)
+            wrap_future(
+                create_commit_response(
+                    commit1_sha, "First commit", "tree1", {"name": "Author", "email": "author@example.com"}
+                )
+            ),
+            wrap_future(
+                create_commit_response(
+                    commit2_sha, "Second commit", "tree2", {"name": "Author", "email": "author@example.com"}
+                )
+            ),
+            wrap_future(create_ref_response(base_sha)),  # base_ref check
+            wrap_future(create_ref_response(head_sha)),  # head_ref check
+            # Final ref check
+            wrap_future(create_ref_response(head_sha)),
+        ],
+    )
+
+    patched_session_post = mocker.patch(
+        "kodiak.queries.http.AsyncClient.post",
+        side_effect=[
+            wrap_future(create_create_commit_response(rebased1_sha)),
+            wrap_future(create_create_commit_response(rebased2_sha)),
+        ],
+    )
+
+    patched_session_patch = mocker.patch(
+        "kodiak.queries.http.AsyncClient.patch",
+        return_value=wrap_future(create_update_ref_response()),
+    )
+
+    async with api_client as api_client:
+        res = await api_client.rebase_branch(
+            base_ref="main", head_ref="feature", head_sha=head_sha
+        )
+
+    assert res.status_code == 200
+    # Verify commits were created in order
+    assert patched_session_post.call_count == 2
+    # Verify ref was updated with force=True
+    assert patched_session_patch.call_count == 1
+    call_args = patched_session_patch.call_args
+    assert call_args[1]["json"]["force"] is True
+    assert call_args[1]["json"]["sha"] == rebased2_sha
+
+
+async def test_rebase_branch_no_commits(
+    mocker: MockFixture, api_client: Client, mock_get_token_for_install: None
+) -> None:
+    """
+    Test rebase when there are no commits to rebase (early exit).
+    """
+    base_sha = "base123"
+    head_sha = "head123"
+
+    mocker.patch(
+        "kodiak.queries.http.AsyncClient.get",
+        side_effect=[
+            wrap_future(create_ref_response(head_sha)),  # head_ref
+            wrap_future(create_ref_response(base_sha)),  # base_ref
+            wrap_future(create_compare_response([])),  # compare (no commits)
+        ],
+    )
+
+    async with api_client as api_client:
+        res = await api_client.rebase_branch(
+            base_ref="main", head_ref="feature", head_sha=head_sha
+        )
+
+    assert res.status_code == 200
+
+
+async def test_rebase_branch_force_with_lease_failure_initial(
+    mocker: MockFixture, api_client: Client, mock_get_token_for_install: None
+) -> None:
+    """
+    Test rebase fails when head ref changes before initial check (force-with-lease).
+    """
+    base_sha = "base123"
+    head_sha = "head123"
+    current_sha = "different123"  # Different from expected
+
+    mocker.patch(
+        "kodiak.queries.http.AsyncClient.get",
+        side_effect=[
+            wrap_future(create_ref_response(current_sha)),  # head_ref (different!)
+            wrap_future(create_ref_response(base_sha)),  # base_ref
+        ],
+    )
+
+    async with api_client as api_client:
+        with pytest.raises(Exception) as exc_info:
+            await api_client.rebase_branch(
+                base_ref="main", head_ref="feature", head_sha=head_sha
+            )
+        assert "force-with-lease" in str(exc_info.value).lower() or "updated" in str(
+            exc_info.value
+        ).lower()
+
+
+async def test_rebase_branch_force_with_lease_failure_during_operation(
+    mocker: MockFixture, api_client: Client, mock_get_token_for_install: None
+) -> None:
+    """
+    Test rebase fails when head ref changes during commit creation (force-with-lease).
+    """
+    base_sha = "base123"
+    head_sha = "head123"
+    commit1_sha = "commit1"
+    changed_sha = "changed123"
+
+    mocker.patch(
+        "kodiak.queries.http.AsyncClient.get",
+        side_effect=[
+            # Initial ref fetches
+            wrap_future(create_ref_response(head_sha)),  # head_ref
+            wrap_future(create_ref_response(base_sha)),  # base_ref
+            # Compare API
+            wrap_future(create_compare_response([{"sha": commit1_sha}])),
+            # Commit fetch + ref checks
+            wrap_future(
+                create_commit_response(commit1_sha, "Commit", "tree1")
+            ),
+            wrap_future(create_ref_response(base_sha)),  # base_ref check
+            wrap_future(create_ref_response(changed_sha)),  # head_ref check (changed!)
+            # Final ref check
+            wrap_future(create_ref_response(changed_sha)),
+        ],
+    )
+
+    mocker.patch(
+        "kodiak.queries.http.AsyncClient.post",
+        return_value=wrap_future(create_create_commit_response("rebased1")),
+    )
+
+    async with api_client as api_client:
+        with pytest.raises(Exception) as exc_info:
+            await api_client.rebase_branch(
+                base_ref="main", head_ref="feature", head_sha=head_sha
+            )
+        assert "force-with-lease" in str(exc_info.value).lower() or "updated" in str(
+            exc_info.value
+        ).lower()
+
+
+async def test_rebase_branch_base_branch_updated(
+    mocker: MockFixture, api_client: Client, mock_get_token_for_install: None
+) -> None:
+    """
+    Test rebase handles base branch updates during operation.
+    """
+    base_sha = "base123"
+    base_sha_new = "base456"
+    head_sha = "head123"
+    commit1_sha = "commit1"
+    rebased1_sha = "rebased1"
+
+    patched_session_get = mocker.patch(
+        "kodiak.queries.http.AsyncClient.get",
+        side_effect=[
+            # Initial ref fetches
+            wrap_future(create_ref_response(head_sha)),  # head_ref
+            wrap_future(create_ref_response(base_sha)),  # base_ref
+            # Compare API (initial)
+            wrap_future(create_compare_response([{"sha": commit1_sha}])),
+            # Commit fetch + ref checks (base changed!)
+            wrap_future(
+                create_commit_response(commit1_sha, "Commit", "tree1")
+            ),
+            wrap_future(create_ref_response(base_sha_new)),  # base_ref check (changed!)
+            wrap_future(create_ref_response(head_sha)),  # head_ref check
+            # Re-compare with new base
+            wrap_future(create_compare_response([{"sha": commit1_sha}])),
+            # Re-fetch commits
+            wrap_future(
+                create_commit_response(commit1_sha, "Commit", "tree1")
+            ),
+            # Final ref check
+            wrap_future(create_ref_response(head_sha)),
+        ],
+    )
+
+    mocker.patch(
+        "kodiak.queries.http.AsyncClient.post",
+        return_value=wrap_future(create_create_commit_response(rebased1_sha)),
+    )
+
+    mocker.patch(
+        "kodiak.queries.http.AsyncClient.patch",
+        return_value=wrap_future(create_update_ref_response()),
+    )
+
+    async with api_client as api_client:
+        res = await api_client.rebase_branch(
+            base_ref="main", head_ref="feature", head_sha=head_sha
+        )
+
+    assert res.status_code == 200
+    # Should have called compare API twice (once initial, once after base change)
+    assert patched_session_get.call_count >= 4
+
+
+async def test_rebase_branch_preserves_commit_history(
+    mocker: MockFixture, api_client: Client, mock_get_token_for_install: None
+) -> None:
+    """
+    Test that rebase preserves individual commit messages and authors.
+    """
+    base_sha = "base123"
+    head_sha = "head123"
+    commit1_sha = "commit1"
+    commit2_sha = "commit2"
+    rebased1_sha = "rebased1"
+    rebased2_sha = "rebased2"
+
+    author1 = {"name": "Alice", "email": "alice@example.com", "date": "2023-01-01T00:00:00Z"}
+    author2 = {"name": "Bob", "email": "bob@example.com", "date": "2023-01-02T00:00:00Z"}
+
+    mocker.patch(
+        "kodiak.queries.http.AsyncClient.get",
+        side_effect=[
+            wrap_future(create_ref_response(head_sha)),
+            wrap_future(create_ref_response(base_sha)),
+            wrap_future(
+                create_compare_response(
+                    [{"sha": commit1_sha}, {"sha": commit2_sha}]
+                )
+            ),
+            wrap_future(
+                create_commit_response(
+                    commit1_sha, "First commit message", "tree1", author1
+                )
+            ),
+            wrap_future(
+                create_commit_response(
+                    commit2_sha, "Second commit message", "tree2", author2
+                )
+            ),
+            wrap_future(create_ref_response(base_sha)),
+            wrap_future(create_ref_response(head_sha)),
+            wrap_future(create_ref_response(head_sha)),
+        ],
+    )
+
+    patched_session_post = mocker.patch(
+        "kodiak.queries.http.AsyncClient.post",
+        side_effect=[
+            wrap_future(create_create_commit_response(rebased1_sha)),
+            wrap_future(create_create_commit_response(rebased2_sha)),
+        ],
+    )
+
+    mocker.patch(
+        "kodiak.queries.http.AsyncClient.patch",
+        return_value=wrap_future(create_update_ref_response()),
+    )
+
+    async with api_client as api_client:
+        await api_client.rebase_branch(
+            base_ref="main", head_ref="feature", head_sha=head_sha
+        )
+
+    # Verify commits were created with correct messages and authors
+    assert patched_session_post.call_count == 2
+    
+    # Check first commit
+    first_call = patched_session_post.call_args_list[0]
+    first_body = first_call[1]["json"]
+    assert first_body["message"] == "First commit message"
+    assert first_body["author"] == author1
+    assert first_body["parents"] == [base_sha]
+    
+    # Check second commit
+    second_call = patched_session_post.call_args_list[1]
+    second_body = second_call[1]["json"]
+    assert second_body["message"] == "Second commit message"
+    assert second_body["author"] == author2
+    assert second_body["parents"] == [rebased1_sha]  # Parent is first rebased commit

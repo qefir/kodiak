@@ -6,7 +6,7 @@ import pytest
 from typing_extensions import Protocol
 
 import kodiak.http as requests
-from kodiak.config import V1, Merge, MergeMethod
+from kodiak.config import V1, Merge, MergeMethod, UpdateStrategy
 from kodiak.errors import ApiCallException
 from kodiak.http import Request
 from kodiak.pull_request import PRV2, EventInfoResponse, QueueForMergeCallback
@@ -161,8 +161,18 @@ class MockUpdateBranch(BaseMockFunc):
 class MockUpdateRef(BaseMockFunc):
     response: requests.Response
 
-    async def __call__(self, *, ref: str, sha: str) -> requests.Response:
-        self.log_call(dict(ref=ref, sha=sha))
+    async def __call__(self, *, ref: str, sha: str, force: bool = False) -> requests.Response:
+        self.log_call(dict(ref=ref, sha=sha, force=force))
+        return self.response
+
+
+class MockRebaseBranch(BaseMockFunc):
+    response: requests.Response
+
+    async def __call__(
+        self, *, base_ref: str, head_ref: str, head_sha: str
+    ) -> requests.Response:
+        self.log_call(dict(base_ref=base_ref, head_ref=head_ref, head_sha=head_sha))
         return self.response
 
 
@@ -171,6 +181,7 @@ class FakeClientProtocol(Protocol):
     delete_label: MockDeleteLabel
     add_label: MockAddLabel
     update_branch: MockUpdateBranch
+    rebase_branch: MockRebaseBranch
     update_ref: MockUpdateRef
 
     def __init__(self, *args: object, **kwargs: object) -> None:
@@ -191,6 +202,7 @@ def create_client() -> Type[FakeClientProtocol]:
         delete_label = MockDeleteLabel()
         add_label = MockAddLabel()
         update_branch = MockUpdateBranch()
+        rebase_branch = MockRebaseBranch()
         update_ref = MockUpdateRef()
 
         def __init__(self, *args: object, **kwargs: object) -> None:
@@ -302,8 +314,10 @@ async def test_pr_v2_update_branch_ok() -> None:
     We should be able to update a branch.
     """
     client = create_client()
+    event = create_event()
+    event.config.update.strategy = UpdateStrategy.merge  # Explicitly set strategy
     client.update_branch.response = create_response(content=b"", status_code=204)
-    pr_v2 = create_prv2(client=client)
+    pr_v2 = create_prv2(client=client, event=event)
     await pr_v2.update_branch()
     assert client.update_branch.call_count == 1
     assert client.update_branch.calls[0]["pull_number"] == pr_v2.number
@@ -314,10 +328,12 @@ async def test_pr_v2_update_branch_service_unavailable() -> None:
     We should raise ApiCallException when we get a bad API response.
     """
     client = create_client()
+    event = create_event()
+    event.config.update.strategy = UpdateStrategy.merge  # Explicitly set strategy
     client.update_branch.response = create_response(
         content=b"<html>Service Unavailable</html>", status_code=503
     )
-    pr_v2 = create_prv2(client=client)
+    pr_v2 = create_prv2(client=client, event=event)
     with pytest.raises(ApiCallException) as e:
         await pr_v2.update_branch()
     assert client.update_branch.call_count == 1
@@ -397,7 +413,7 @@ async def test_update_ref_ok() -> None:
     await pr_v2.update_ref(ref="master", sha="aa218f56b14c9653891f9e74264a383fa43fefbd")
     assert client.update_ref.call_count == 1
     assert client.update_ref.calls[0] == dict(
-        ref="master", sha="aa218f56b14c9653891f9e74264a383fa43fefbd"
+        ref="master", sha="aa218f56b14c9653891f9e74264a383fa43fefbd", force=False
     )
 
 
@@ -416,8 +432,68 @@ async def test_update_ref_service_unavailable() -> None:
         )
     assert client.update_ref.call_count == 1
     assert client.update_ref.calls[0] == dict(
-        ref="master", sha="aa218f56b14c9653891f9e74264a383fa43fefbd"
+        ref="master", sha="aa218f56b14c9653891f9e74264a383fa43fefbd", force=False
     )
     assert e.value.method == "pull_request/update_ref"
     assert e.value.status_code == 503
     assert b"Service Unavailable" in e.value.response
+
+
+async def test_pr_v2_update_branch_rebase_strategy() -> None:
+    """
+    We should be able to update a branch using rebase strategy.
+    """
+    client = create_client()
+    client.rebase_branch.response = create_response(content=b"", status_code=200)
+    
+    event = create_event()
+    event.config.update.strategy = UpdateStrategy.rebase
+    
+    pr_v2 = create_prv2(client=client, event=event)
+    await pr_v2.update_branch()
+    
+    assert client.rebase_branch.call_count == 1
+    assert client.update_branch.call_count == 0  # Should not use merge strategy
+    assert client.rebase_branch.calls[0]["base_ref"] == event.pull_request.baseRefName
+    assert client.rebase_branch.calls[0]["head_ref"] == event.pull_request.headRefName
+    assert client.rebase_branch.calls[0]["head_sha"] == event.pull_request.latest_sha
+
+
+async def test_pr_v2_update_branch_merge_strategy() -> None:
+    """
+    We should be able to update a branch using merge strategy (default).
+    """
+    client = create_client()
+    client.update_branch.response = create_response(content=b"", status_code=204)
+    
+    event = create_event()
+    event.config.update.strategy = UpdateStrategy.merge
+    
+    pr_v2 = create_prv2(client=client, event=event)
+    await pr_v2.update_branch()
+    
+    assert client.update_branch.call_count == 1
+    assert client.rebase_branch.call_count == 0  # Should not use rebase strategy
+    assert client.update_branch.calls[0]["pull_number"] == pr_v2.number
+
+
+async def test_pr_v2_update_branch_rebase_error() -> None:
+    """
+    We should raise ApiCallException when rebase fails.
+    """
+    client = create_client()
+    client.rebase_branch.response = create_response(
+        content=b'{"message":"Branch was updated"}', status_code=422
+    )
+    
+    event = create_event()
+    event.config.update.strategy = UpdateStrategy.rebase
+    
+    pr_v2 = create_prv2(client=client, event=event)
+    with pytest.raises(ApiCallException) as e:
+        await pr_v2.update_branch()
+    
+    assert client.rebase_branch.call_count == 1
+    assert e.value.method == "pull_request/rebase_branch"
+    assert e.value.status_code == 422
+    assert b"Branch was updated" in e.value.response

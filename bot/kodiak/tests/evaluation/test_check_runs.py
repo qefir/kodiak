@@ -3,6 +3,7 @@ Tests for flows that depend on status checks or check_runs.
 """
 import pytest
 
+from kodiak.config import UpdateStrategy
 from kodiak.errors import PollForever, RetryForSkippableChecks
 from kodiak.queries import StatusState
 from kodiak.test_evaluation import (
@@ -400,6 +401,7 @@ async def test_mergeable_update_always() -> None:
 
     config.update.always = True
     config.update.require_automerge_label = True
+    config.update.strategy = UpdateStrategy.merge  # Explicitly set strategy
 
     pull_request.mergeStateStatus = MergeStateStatus.BEHIND
     branch_protection.requiresStatusChecks = True
@@ -436,6 +438,7 @@ async def test_mergeable_update_autoupdate_label() -> None:
     check_run = create_check_run()
 
     config.update.autoupdate_label = "update me please!"
+    config.update.strategy = UpdateStrategy.merge  # Explicitly set strategy
 
     # create a pull requests that's behind and failing checks. We should still
     # update on failing checks.
@@ -529,6 +532,7 @@ async def test_mergeable_update_always_no_require_automerge_label_missing_label(
 
     config.update.always = True
     config.update.require_automerge_label = False
+    config.update.strategy = UpdateStrategy.merge  # Explicitly set strategy
 
     pull_request.mergeStateStatus = MergeStateStatus.BEHIND
     branch_protection.requiresStatusChecks = True

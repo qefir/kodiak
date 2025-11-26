@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ssl
+import certifi
 
 from httpx import (  # noqa: I251
     AsyncClient,
@@ -15,7 +16,7 @@ from httpx._types import TimeoutTypes  # noqa: I251
 __all__ = ["Response", "Request", "HTTPError", "HttpClient", "HTTPStatusError"]
 
 # NOTE: this has a cost to create so we may want to set this lazily on the first HttpClient creation
-context = ssl.create_default_context()
+context = ssl.create_default_context(cafile=certifi.where())
 
 
 class HttpClient(AsyncClient):

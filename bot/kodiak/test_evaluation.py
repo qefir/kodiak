@@ -7,7 +7,7 @@ import pytest
 from toml import TomlDecodeError
 from typing_extensions import Protocol
 
-from kodiak.config import V1, MergeMethod
+from kodiak.config import V1, MergeMethod, UpdateStrategy
 from kodiak.errors import GitHubApiInternalServerError, PollForever
 from kodiak.evaluation import PRAPI
 from kodiak.evaluation import mergeable as mergeable_func
@@ -1722,6 +1722,7 @@ async def test_mergeable_do_not_merge_with_update_branch_immediately_need_update
     pull_request.mergeStateStatus = MergeStateStatus.BEHIND
     config.merge.do_not_merge = True
     config.merge.update_branch_immediately = True
+    config.update.strategy = UpdateStrategy.merge  # Explicitly set strategy
     await mergeable(api=api, config=config, pull_request=pull_request)
 
     assert api.update_branch.called is True
@@ -1729,6 +1730,85 @@ async def test_mergeable_do_not_merge_with_update_branch_immediately_need_update
     assert "updating branch" in api.set_status.calls[0]["msg"]
     assert api.queue_for_merge.called is False
     assert api.merge.called is False
+
+
+async def test_mergeable_update_branch_immediately_rebase_strategy() -> None:
+    """
+    Test that update_branch_immediately uses rebase strategy when configured.
+    """
+    mergeable = create_mergeable()
+    api = create_api()
+    pull_request = create_pull_request()
+    config = create_config()
+    pull_request.mergeStateStatus = MergeStateStatus.BEHIND
+    config.merge.update_branch_immediately = True
+    config.update.strategy = UpdateStrategy.rebase
+    await mergeable(api=api, config=config, pull_request=pull_request)
+
+    assert api.update_branch.called is True
+    assert api.set_status.called is True
+    assert "rebasing branch" in api.set_status.calls[0]["msg"]
+    assert "rebase" in api.set_status.calls[0]["markdown_content"]
+
+
+async def test_mergeable_update_branch_immediately_merge_strategy() -> None:
+    """
+    Test that update_branch_immediately uses merge strategy when configured.
+    """
+    mergeable = create_mergeable()
+    api = create_api()
+    pull_request = create_pull_request()
+    config = create_config()
+    pull_request.mergeStateStatus = MergeStateStatus.BEHIND
+    config.merge.update_branch_immediately = True
+    config.update.strategy = UpdateStrategy.merge
+    await mergeable(api=api, config=config, pull_request=pull_request)
+
+    assert api.update_branch.called is True
+    assert api.set_status.called is True
+    assert "updating branch" in api.set_status.calls[0]["msg"]
+    assert "rebase" not in api.set_status.calls[0]["msg"]
+
+
+async def test_mergeable_optimistic_update_rebase_strategy() -> None:
+    """
+    Test that optimistic_updates uses rebase strategy when configured.
+    """
+    from kodiak.errors import PollForever
+
+    mergeable = create_mergeable()
+    api = create_api()
+    pull_request = create_pull_request()
+    config = create_config()
+    pull_request.mergeStateStatus = MergeStateStatus.BEHIND
+    config.merge.optimistic_updates = True
+    config.update.strategy = UpdateStrategy.rebase
+    
+    with pytest.raises(PollForever):
+        await mergeable(api=api, config=config, pull_request=pull_request, merging=True)
+
+    assert api.update_branch.called is True
+    assert api.set_status.called is True
+    assert "rebasing branch" in api.set_status.calls[0]["msg"]
+
+
+async def test_mergeable_update_always_rebase_strategy() -> None:
+    """
+    Test that update.always uses rebase strategy when configured.
+    """
+    mergeable = create_mergeable()
+    api = create_api()
+    pull_request = create_pull_request()
+    config = create_config()
+    pull_request.mergeStateStatus = MergeStateStatus.BEHIND
+    config.update.always = True
+    config.update.strategy = UpdateStrategy.rebase
+    await mergeable(api=api, config=config, pull_request=pull_request)
+
+    assert api.update_branch.called is True
+    assert api.set_status.called is True
+    assert "rebasing branch" in api.set_status.calls[0]["msg"]
+    assert "rebase" in api.set_status.calls[0]["markdown_content"]
 
 
 async def test_mergeable_api_call_retry_timeout() -> None:
