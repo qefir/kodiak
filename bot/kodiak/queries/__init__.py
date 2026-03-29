@@ -1,27 +1,39 @@
 from __future__ import annotations
 
-import json
 import urllib
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
-from typing import Any, Dict, List, Mapping, MutableMapping, Optional, Union, cast
+from typing import (
+    Any,
+    Dict,
+    List,
+    Mapping,
+    MutableMapping,
+    Optional,
+    TypedDict,
+    Union,
+    cast,
+)
 
 import jwt
 import pydantic
 import structlog
 import toml
-from mypy_extensions import TypedDict
-from pydantic import BaseModel
+from pydantic import BaseModel, root_validator
 from typing_extensions import Literal, Protocol
 
 import kodiak.app_config as conf
 from kodiak import http
 from kodiak.config import V1, MergeMethod
 from kodiak.http import HttpClient
-from kodiak.queries.commits import Commit, CommitConnection, GitActor
-from kodiak.queries.commits import User as PullRequestCommitUser
-from kodiak.queries.commits import get_commits
+from kodiak.queries.commits import (
+    Commit,
+    CommitConnection,
+    GitActor,
+    User as PullRequestCommitUser,
+    get_commits,
+)
 from kodiak.redis_client import redis_web_api
 from kodiak.throttle import get_thottler_for_installation
 
@@ -181,9 +193,6 @@ query GetEventInfo($owner: String!, $repo: String!, $PRNumber: Int!) {
         }
       }
     }
-    defaultBranchRef {
-      name
-    }
     mergeCommitAllowed
     rebaseMergeAllowed
     squashMergeAllowed
@@ -342,7 +351,7 @@ query GetEventInfo($owner: String!, $repo: String!, $PRNumber: Int!) {
   }
 }
 
-""" % dict(
+""" % dict(  # noqa: UP031
         requiresConversationResolution="requiresConversationResolution"
         if requires_conversation_resolution
         else "",
@@ -463,7 +472,8 @@ class EventInfoResponse:
     pull_request: PullRequest
     repository: RepoInfo
     subscription: Optional[Subscription]
-    branch_protection: Optional[UnifiedBranchProtection]
+    branch_protection: Optional[BranchProtectionRule]
+    ruleset_rules: List[RulesetRule]
     review_requests: List[PRReviewRequest]
     head_exists: bool
     bot_reviews: List[PRReview] = field(default_factory=list)
@@ -504,6 +514,45 @@ class NodeListPushAllowance(BaseModel):
     nodes: List[PushAllowance]
 
 
+class MergeQueueMergeMethod(Enum):
+    MERGE = "MERGE"
+
+    SQUASH = "SQUASH"
+
+    REBASE = "REBASE"
+
+
+class PullRequestAllowedMergeMethods(Enum):
+    MERGE = "MERGE"
+    SQUASH = "SQUASH"
+
+    REBASE = "REBASE"
+
+
+class PullRequestParameters(BaseModel):
+    allowedMergeMethods: Optional[List[PullRequestAllowedMergeMethods]] = None
+    requiredReviewThreadResolution: bool
+
+
+class MergeQueueParameters(BaseModel):
+    mergeMethod: MergeQueueMergeMethod
+
+
+class StatusCheckConfiguration(BaseModel):
+    """Status check configuration item."""
+
+    context: str
+
+
+class RequiredStatusChecksParameters(BaseModel):
+    strictRequiredStatusChecksPolicy: bool
+    requiredStatusChecks: List[StatusCheckConfiguration]
+
+
+class UpdateParameters(BaseModel):
+    updateAllowsFetchAndMerge: bool
+
+
 class BranchProtectionRule(BaseModel):
     """
     https://developer.github.com/v4/object/branchprotectionrule/
@@ -518,227 +567,38 @@ class BranchProtectionRule(BaseModel):
     pushAllowances: NodeListPushAllowance
 
 
-class RefNameConditions(BaseModel):
-    include: Optional[List[str]] = None
-    exclude: Optional[List[str]] = None
-
-
-class RulesetConditions(BaseModel):
-    refName: Optional[RefNameConditions] = None
-
-
-class RulesetBypassActorActor(BaseModel):
+class BypassActor(BaseModel):
     databaseId: Optional[int] = None
 
 
-class RulesetBypassActor(BaseModel):
-    actor: RulesetBypassActorActor
+class RepositoryRulesetBypassActor(BaseModel):
+    actor: Optional[BypassActor] = None
 
 
-class RulesetBypassActorConnection(BaseModel):
-    nodes: Optional[List[RulesetBypassActor]] = None
-
-
-class StatusCheckConfiguration(BaseModel):
-    """Status check configuration item."""
-
-    context: str
-
-
-class RulesetRuleParameters(BaseModel):
-    """Rule parameters from GitHub's RuleParameters union types."""
-
-    requiredStatusChecks: Optional[List[StatusCheckConfiguration]] = None
-    strictRequiredStatusChecksPolicy: Optional[bool] = None
-    requiredReviewThreadResolution: Optional[bool] = None
-
-    class Config:
-        extra = "allow"
+class RepositoryRulesetBypassActorConnection(BaseModel):
+    nodes: Optional[List[Optional[RepositoryRulesetBypassActor]]] = None
 
 
 class RepositoryRuleset(BaseModel):
-    bypassActors: Optional[RulesetBypassActorConnection] = None
+    bypassActors: Optional[RepositoryRulesetBypassActorConnection] = None
 
 
 class RulesetRule(BaseModel):
     type: str
-    parameters: Optional[RulesetRuleParameters] = None
+    parameters: Union[
+        MergeQueueParameters,
+        PullRequestParameters,
+        RequiredStatusChecksParameters,
+        UpdateParameters,
+        None,
+    ] = None
     repositoryRuleset: Optional[RepositoryRuleset] = None
 
-    @classmethod
-    def parse_obj(cls, obj: Any) -> "RulesetRule":
-        """Parse RulesetRule, handling parameters as JSON string if needed."""
-        if isinstance(obj, dict):
-            params = obj.get("parameters")
-            if isinstance(params, str):
-                try:
-                    obj = obj.copy()
-                    obj["parameters"] = json.loads(params)
-                except (json.JSONDecodeError, TypeError):
-                    logger.warning(
-                        "Failed to parse ruleset rule parameters as JSON",
-                        rule_type=obj.get("type"),
-                    )
-        return super().parse_obj(obj)
-
-
-class RulesetRuleConnection(BaseModel):
-    nodes: Optional[List[RulesetRule]] = None
-
-
-class Ruleset(BaseModel):
-    """GitHub ruleset from GraphQL API."""
-
-    id: str
-    name: str
-    target: str
-    enforcement: str
-    conditions: Optional[RulesetConditions] = None
-    bypassActors: Optional[RulesetBypassActorConnection] = None
-    rules: Optional[RulesetRuleConnection] = None
-
-
-@dataclass
-class UnifiedBranchProtection:
-    """Unified interface supporting both BranchProtectionRule and Rulesets."""
-
-    requiresStatusChecks: bool = False
-    requiredStatusCheckContexts: List[str] = field(default_factory=list)
-    requiresStrictStatusChecks: bool = False
-    requiresCommitSignatures: bool = False
-    requiresConversationResolution: Optional[bool] = None
-    restrictsPushes: bool = False
-    pushAllowances: NodeListPushAllowance = field(
-        default_factory=lambda: NodeListPushAllowance(nodes=[])
-    )
-
-    @classmethod
-    def from_branch_protection_rule(
-        cls, rule: BranchProtectionRule
-    ) -> UnifiedBranchProtection:
-        """Convert BranchProtectionRule to UnifiedBranchProtection."""
-        return cls(
-            requiresStatusChecks=rule.requiresStatusChecks,
-            requiredStatusCheckContexts=rule.requiredStatusCheckContexts,
-            requiresStrictStatusChecks=rule.requiresStrictStatusChecks,
-            requiresCommitSignatures=rule.requiresCommitSignatures,
-            requiresConversationResolution=rule.requiresConversationResolution,
-            restrictsPushes=rule.restrictsPushes,
-            pushAllowances=rule.pushAllowances,
-        )
-
-    @classmethod
-    def from_ruleset(cls, ruleset: Ruleset) -> UnifiedBranchProtection:
-        """Convert Ruleset to UnifiedBranchProtection."""
-        protection = cls()
-
-        if not ruleset.rules or not ruleset.rules.nodes:
-            return protection
-
-        for rule in ruleset.rules.nodes:
-            if not rule or not rule.type:
-                continue
-
-            rule_type = rule.type.lower()
-            params = rule.parameters
-
-            if rule_type == "required_status_checks":
-                cls._apply_status_checks(protection, params)
-            elif rule_type == "pull_request":
-                cls._apply_pull_request_rules(protection, params)
-            elif rule_type in (
-                "required_signatures",
-                "required_review_thread_resolution",
-            ):
-                cls._apply_simple_rule(protection, rule_type)
-
-        cls._apply_bypass_actors(protection, ruleset.bypassActors)
-        return protection
-
-    @staticmethod
-    def _apply_status_checks(
-        protection: UnifiedBranchProtection, params: Optional[RulesetRuleParameters]
-    ) -> None:
-        if params and params.requiredStatusChecks:
-            for check in params.requiredStatusChecks:
-                if (
-                    check.context
-                    and check.context not in protection.requiredStatusCheckContexts
-                ):
-                    protection.requiredStatusCheckContexts.append(check.context)
-
-        if params and params.strictRequiredStatusChecksPolicy is not None:
-            protection.requiresStrictStatusChecks = (
-                params.strictRequiredStatusChecksPolicy
-            )
-
-        protection.requiresStatusChecks = True
-
-    @staticmethod
-    def _apply_pull_request_rules(
-        protection: UnifiedBranchProtection, params: Optional[RulesetRuleParameters]
-    ) -> None:
-        if params and params.requiredReviewThreadResolution:
-            protection.requiresConversationResolution = True
-
-    @staticmethod
-    def _apply_simple_rule(protection: UnifiedBranchProtection, rule_type: str) -> None:
-        if rule_type == "required_signatures":
-            protection.requiresCommitSignatures = True
-        elif rule_type == "required_review_thread_resolution":
-            protection.requiresConversationResolution = True
-
-    @staticmethod
-    def _apply_bypass_actors(
-        protection: UnifiedBranchProtection,
-        bypass_actors: Optional[RulesetBypassActorConnection],
-    ) -> None:
-        if not bypass_actors or not bypass_actors.nodes:
-            return
-
-        protection.restrictsPushes = True
-        allowances = [
-            PushAllowance(actor=PushAllowanceActor(databaseId=actor.actor.databaseId))
-            for actor in bypass_actors.nodes
-            if actor and actor.actor
-        ]
-        protection.pushAllowances = NodeListPushAllowance(nodes=allowances)
-
-    def merge(self, other: UnifiedBranchProtection) -> UnifiedBranchProtection:
-        """Merge another UnifiedBranchProtection into this one (most restrictive wins)."""
-        all_contexts = list(
-            set(self.requiredStatusCheckContexts + other.requiredStatusCheckContexts)
-        )
-        conv_res = (
-            self.requiresConversationResolution
-            if self.requiresConversationResolution is not None
-            else other.requiresConversationResolution
-        )
-        if (
-            self.requiresConversationResolution is True
-            or other.requiresConversationResolution is True
-        ):
-            conv_res = True
-
-        merged = UnifiedBranchProtection(
-            requiresStatusChecks=self.requiresStatusChecks
-            or other.requiresStatusChecks
-            or bool(all_contexts),
-            requiredStatusCheckContexts=all_contexts,
-            requiresStrictStatusChecks=self.requiresStrictStatusChecks
-            or other.requiresStrictStatusChecks,
-            requiresCommitSignatures=self.requiresCommitSignatures
-            or other.requiresCommitSignatures,
-            requiresConversationResolution=conv_res,
-            restrictsPushes=self.restrictsPushes or other.restrictsPushes,
-            pushAllowances=NodeListPushAllowance(
-                nodes=self.pushAllowances.nodes + other.pushAllowances.nodes
-            ),
-        )
-        # Ensure that if we have any status check contexts, we require status checks
-        if merged.requiredStatusCheckContexts:
-            merged.requiresStatusChecks = True
-        return merged
+    @root_validator(pre=True)
+    def empty_dict_to_none(cls, values: Dict[Any, Any]) -> Dict[Any, Any]:  # noqa: N805
+        if values.get("parameters") == {}:
+            values["parameters"] = None
+        return values
 
 
 class PRReviewState(Enum):
@@ -889,75 +749,21 @@ def get_branch_protection(
     return None
 
 
-def get_unified_branch_protection(
-    *, repo: Dict[str, Any], ref_name: str
-) -> Optional[UnifiedBranchProtection]:
-    """Get unified branch protection from rules and ref rules."""
-    protection: Optional[UnifiedBranchProtection] = None
-
-    bp_rule = get_branch_protection(repo=repo, ref_name=ref_name)
-    if bp_rule:
-        protection = UnifiedBranchProtection.from_branch_protection_rule(bp_rule)
-
+def get_rules_dicts(*, pull_request: Dict[str, Any]) -> List[Dict[str, Any]]:
     try:
-        pr = repo.get("pullRequest", {})
-        ref_rules_data = pr.get("baseRef", {}).get("rules", {}).get("nodes", [])
+        return cast(List[Dict[str, Any]], pull_request["baseRef"]["rules"]["nodes"])
     except (KeyError, TypeError):
-        ref_rules_data = []
+        return []
 
-    # Parse ref rules directly
-    ref_rules: List[RulesetRule] = []
-    for rule_dict in ref_rules_data:
+
+def get_ruleset_rules(*, pull_request: Dict[str, Any]) -> List[RulesetRule]:
+    rules = []
+    for node in get_rules_dicts(pull_request=pull_request):
         try:
-            rule = RulesetRule.parse_obj(rule_dict)
-            ref_rules.append(rule)
-        except (ValueError, pydantic.ValidationError):
-            logger.warning("Could not parse ref rule", exc_info=True)
-
-    # Create unified protection from ref rules
-    if ref_rules:
-        ref_prot = UnifiedBranchProtection()
-
-        # Collect bypass actors from all referenced repository rulesets
-        all_bypass_actors = []
-        for rule in ref_rules:
-            if (
-                rule
-                and rule.repositoryRuleset
-                and rule.repositoryRuleset.bypassActors
-                and rule.repositoryRuleset.bypassActors.nodes
-            ):
-                all_bypass_actors.extend(rule.repositoryRuleset.bypassActors.nodes)
-
-        # Apply bypass actors if any were found
-        if all_bypass_actors:
-            aggregated_bypass_actors = RulesetBypassActorConnection(
-                nodes=all_bypass_actors
-            )
-            UnifiedBranchProtection._apply_bypass_actors(
-                ref_prot, aggregated_bypass_actors
-            )
-
-        for rule in ref_rules:
-            if not rule or not rule.type:
-                continue
-
-            rule_type = rule.type.lower()
-            params = rule.parameters
-
-            if rule_type == "required_status_checks":
-                UnifiedBranchProtection._apply_status_checks(ref_prot, params)
-            elif rule_type == "pull_request":
-                UnifiedBranchProtection._apply_pull_request_rules(ref_prot, params)
-            elif rule_type == "required_signatures":
-                # REQUIRED_SIGNATURES rule type means commit signatures are required
-                ref_prot.requiresCommitSignatures = True
-            elif rule_type == "required_review_thread_resolution":
-                UnifiedBranchProtection._apply_simple_rule(ref_prot, rule_type)
-
-        protection = ref_prot if protection is None else protection.merge(ref_prot)
-
-    return protection
+            rules.append(RulesetRule.parse_obj(node))
+        except ValueError:
+            logger.warning("Could not parse RulesetRule", exc_info=True)
+    return rules
 
 
 def get_review_requests_dicts(*, pr: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -1144,18 +950,17 @@ _api_features_cache: ApiFeatures | None = None
 
 
 class ThrottlerProtocol(Protocol):
-    async def __aenter__(self) -> None:
-        ...
+    async def __aenter__(self) -> None: ...
 
-    async def __aexit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
-        ...
+    async def __aexit__(
+        self, exc_type: object, exc_value: object, traceback: object
+    ) -> None: ...
 
 
 class Client:
     throttler: ThrottlerProtocol
 
     def __init__(self, *, owner: str, repo: str, installation_id: str):
-
         self.owner = owner
         self.repo = repo
         self.installation_id = installation_id
@@ -1166,16 +971,16 @@ class Client:
             # client. As a backup we have an asyncio timeout of 30 seconds.
             timeout=None
         )
-        self.session.headers[
-            "Accept"
-        ] = "application/vnd.github.antiope-preview+json,application/vnd.github.merge-info-preview+json"
+        self.session.headers["Accept"] = (
+            "application/vnd.github.antiope-preview+json,application/vnd.github.merge-info-preview+json"
+        )
         if (
             conf.GITHUB_API_HEADER_NAME is not None
             and conf.GITHUB_API_HEADER_VALUE is not None
         ):
-            self.session.headers[
-                conf.GITHUB_API_HEADER_NAME
-            ] = conf.GITHUB_API_HEADER_VALUE
+            self.session.headers[conf.GITHUB_API_HEADER_NAME] = (
+                conf.GITHUB_API_HEADER_VALUE
+            )
         self.log = logger.bind(
             owner=self.owner, repo=self.repo, install=self.installation_id
         )
@@ -1186,7 +991,9 @@ class Client:
         )
         return self
 
-    async def __aexit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+    async def __aexit__(
+        self, exc_type: object, exc_value: object, traceback: object
+    ) -> None:
         await self.session.aclose()
 
     async def send_query(
@@ -1227,7 +1034,7 @@ class Client:
         first client to make an API request, we use their credentials to view
         schema metadata and cache the results.
         """
-        global _api_features_cache  # pylint: disable=global-statement
+        global _api_features_cache
         if _api_features_cache is not None:
             return _api_features_cache
         res = await self.send_query(
@@ -1438,9 +1245,10 @@ query {
         if cfg is None:
             log.info("no config found")
             return None
-        branch_protection = get_unified_branch_protection(
+        branch_protection = get_branch_protection(
             repo=repository, ref_name=pr.baseRefName
         )
+        ruleset_rules = get_ruleset_rules(pull_request=pull_request)
 
         all_reviews = get_reviews(pr=pull_request)
         bot_reviews = self.get_bot_reviews(reviews=all_reviews)
@@ -1458,6 +1266,7 @@ query {
             ),
             subscription=subscription,
             branch_protection=branch_protection,
+            ruleset_rules=ruleset_rules,
             review_requests=get_requested_reviews(pr=pull_request),
             bot_reviews=bot_reviews,
             status_contexts=get_status_contexts(pr=pull_request),
@@ -1694,8 +1503,8 @@ def generate_jwt(*, private_key: str, app_identifier: str) -> str:
 
     This is different from authenticating as an installation
     """
-    issued_at = int(datetime.now().timestamp())
-    expiration = int((datetime.now() + timedelta(minutes=9, seconds=30)).timestamp())
+    issued_at = int(datetime.now().timestamp())  # noqa: DTZ005
+    expiration = int((datetime.now() + timedelta(minutes=9, seconds=30)).timestamp())  # noqa: DTZ005
     payload = dict(iat=issued_at, exp=expiration, iss=app_identifier)
     return jwt.encode(payload=payload, key=private_key, algorithm="RS256").decode()
 
@@ -1744,4 +1553,4 @@ async def get_headers(
     )
 
 
-__all__ = ["Commit", "GitActor", "CommitConnection", "PullRequestCommitUser"]
+__all__ = ["Commit", "CommitConnection", "GitActor", "PullRequestCommitUser"]

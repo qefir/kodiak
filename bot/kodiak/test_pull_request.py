@@ -1,6 +1,16 @@
 from __future__ import annotations
 
-from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Type, cast
+from typing import (
+    Any,
+    Awaitable,
+    Callable,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Type,
+    cast,
+)
 
 import pytest
 from typing_extensions import Protocol
@@ -11,6 +21,7 @@ from kodiak.errors import ApiCallException
 from kodiak.http import Request
 from kodiak.pull_request import PRV2, EventInfoResponse, QueueForMergeCallback
 from kodiak.queries import (
+    BranchProtectionRule,
     Client,
     MergeableState,
     MergeStateStatus,
@@ -20,7 +31,6 @@ from kodiak.queries import (
     PullRequestState,
     RepoInfo,
     ReviewThreadConnection,
-    UnifiedBranchProtection,
 )
 
 
@@ -55,7 +65,7 @@ def create_event() -> EventInfoResponse:
         is_private=True,
         delete_branch_on_merge=False,
     )
-    branch_protection = UnifiedBranchProtection(
+    branch_protection = BranchProtectionRule(
         requiresStatusChecks=True,
         requiredStatusCheckContexts=[
             "ci/circleci: frontend_lint",
@@ -80,6 +90,7 @@ method = "squash"
         pull_request=pr,
         repository=rep_info,
         branch_protection=branch_protection,
+        ruleset_rules=[],
         review_requests=[],
         bot_reviews=[],
         status_contexts=[],
@@ -173,16 +184,13 @@ class FakeClientProtocol(Protocol):
     update_branch: MockUpdateBranch
     update_ref: MockUpdateRef
 
-    def __init__(self, *args: object, **kwargs: object) -> None:
-        ...
+    def __init__(self, *args: object, **kwargs: object) -> None: ...
 
-    async def __aenter__(self) -> FakeClientProtocol:
-        ...
+    async def __aenter__(self) -> FakeClientProtocol: ...
 
     async def __aexit__(
         self, exc_type: object, exc_value: object, traceback: object
-    ) -> None:
-        ...
+    ) -> None: ...
 
 
 def create_client() -> Type[FakeClientProtocol]:
@@ -196,7 +204,7 @@ def create_client() -> Type[FakeClientProtocol]:
         def __init__(self, *args: object, **kwargs: object) -> None:
             pass
 
-        async def __aenter__(self) -> "FakeClient":
+        async def __aenter__(self) -> FakeClient:
             return self
 
         async def __aexit__(
